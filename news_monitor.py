@@ -35,7 +35,14 @@ MAX_SEEN = 500          # сколько последних ссылок пом�
 MAX_ATTEMPTS = 5        # сколько записей пробуем за запуск
 TIMEOUT = 20
 USER_AGENT = "Mozilla/5.0 (compatible; news-monitor/1.0)"
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+ARTICLE_CHARS = 4000    # сколько текста статьи отдаём модели
+
+# Добавлять ли в пост строку «Источник» со ссылкой
+SOURCE_LINK_SERVICE = False   # рубрика «сервисы»: False = готовый пост без ссылки
+SOURCE_LINK_HUMOR = True      # рубрика «юмор»: подпись «Источник» под мемом
+
+SKIP = "SKIP"           # модель решила, что материал не подходит
 
 # Слоты по московскому времени -> рубрика
 SLOTS = {9: "service", 12: "humor", 15: "service", 18: "humor", 21: "humor"}
@@ -144,32 +151,85 @@ def find_image(entry):
 
 # ---------------------------------------------------------------- Groq
 
-def groq_blurb(title, text):
+def article_text(entry, fallback):
+    """Текст материала: из ленты, если он там полный, иначе со страницы статьи."""
+    for c in entry.get("content", []) or []:
+        t = strip_html(c.get("value", ""))
+        if len(t) > 800:
+            return t[:ARTICLE_CHARS]
+    link = entry_key(entry)
+    try:
+        r = requests.get(link, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT)
+        r.raise_for_status()
+        page = re.sub(r"(?is)<(script|style|nav|header|footer|aside)[^>]*>.*?</\1>", " ", r.text)
+        m = re.search(r"(?is)<article[^>]*>(.*?)</article>", page)
+        t = strip_html(m.group(1) if m else page)
+        if len(t) > len(fallback):
+            return t[:ARTICLE_CHARS]
+    except Exception as e:  # noqa: BLE001
+        log(f"  страницу статьи не загрузить: {type(e).__name__}: {e}")
+    return fallback[:ARTICLE_CHARS]
+
+
+def parse_post(content):
+    """Ответ модели -> (заголовок, текст) или SKIP или None."""
+    content = (content or "").strip()
+    if content.upper().startswith(SKIP) and len(content) < 20:
+        return SKIP
+    content = content.replace("*", "").replace("#", "")
+    lines = [ln.strip() for ln in content.splitlines()]
+    lines = [ln for ln in lines if ln]
+    if len(lines) < 2:
+        return None
+    headline = re.sub(r"^(заголовок|название)\s*:\s*", "", lines[0], flags=re.IGNORECASE)
+    headline = headline.strip(" «»\"'")
+    body = "\n\n".join(lines[1:]) if len(lines) > 2 else lines[1]
+    return (headline, body) if headline and body else None
+
+
+def groq_post(title, text):
+    """Готовый пост от модели: (заголовок, текст), SKIP (не подходит) или None (ошибка)."""
     key = os.getenv("GROQ_API_KEY_NEWS")
     if not key:
+        log("  нет ключа GROQ_API_KEY_NEWS")
         return None
     prompt = (
-        "Ты редактор Telegram-канала про IT, нейросети и автоматизацию работы. "
-        "По заголовку и описанию напиши 1-2 коротких предложения по-русски: "
-        "что это за сервис или материал и чем он полезен в работе. "
-        "Используй только факты из текста, не выдумывай цифры, названия и функции. "
-        "Без хэштегов, без ссылок, без восклицательных знаков.\n\n"
-        f"Заголовок: {title}\nОписание: {text[:1500]}"
+        "Ты редактор Telegram-канала команды разработчиков «Сила ботов»: Telegram-боты, "
+        "нейросети, IT и автоматизация бизнеса. Канал читают предприниматели и офисные "
+        "сотрудники. Тебе дан материал.\n\n"
+        "Если он не про полезный сервис, инструмент, приложение, нейросеть или способ "
+        "автоматизировать работу (например, политика, железо, узкая разработка, новости "
+        "рынка, реклама), ответь одним словом: SKIP\n\n"
+        "Иначе напиши готовый пост на русском языке, без ссылок и без фраз вроде "
+        "«читайте далее»:\n"
+        "- первая строка: короткий заголовок до 70 символов, без кавычек и разметки;\n"
+        "- пустая строка;\n"
+        "- 3-5 предложений (400-700 символов): что это за сервис или приём, что он умеет, "
+        "кому и чем полезен в работе;\n"
+        "- используй только факты из текста, не выдумывай цифры, цены, названия и функции;\n"
+        "- без хэштегов, без эмодзи, без разметки Markdown.\n\n"
+        f"Материал:\n{title}\n{text}"
     )
+    body = {
+        "model": GROQ_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.3,
+        "max_tokens": 600,
+    }
+    if "gpt-oss" in GROQ_MODEL:
+        # модель с «рассуждением»: короткое рассуждение и запас токенов, иначе ответ может обрезаться
+        body["reasoning_effort"] = "low"
+        body["max_tokens"] = 1500
     try:
         r = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers={"Authorization": f"Bearer {key}"},
-            json={
-                "model": GROQ_MODEL,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.3,
-                "max_tokens": 200,
-            },
-            timeout=30,
+            json=body,
+            timeout=45,
         )
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"].strip()
+        if not r.ok:  # показываем ответ Groq целиком, чтобы была видна причина
+            raise RuntimeError(f"{r.status_code} {r.text[:300]}")
+        return parse_post(r.json()["choices"][0]["message"]["content"])
     except Exception as e:  # noqa: BLE001
         log(f"  Groq не ответил: {type(e).__name__}: {e}")
         return None
@@ -220,18 +280,26 @@ def run_service(seen):
 
     for key, e, text in candidates[:MAX_ATTEMPTS]:
         title = strip_html(e.get("title", "")) or "Без названия"
-        blurb = groq_blurb(title, text)
-        if not blurb:
-            # запасной вариант без модели: начало описания из ленты
-            blurb = text[len(title):].strip()[:200] if text.startswith(title) else text[:200]
-        post = f"<b>{esc(title)}</b>\n\n{esc(blurb)}\n\n<a href=\"{esc(key)}\">Читать</a>"
+        result = groq_post(title, article_text(e, text))
+        if result is None:
+            # Groq недоступен или ответил непонятно: без модели готовый пост не сделать
+            log("::warning::Groq не дал пост, рубрика сервисов пропущена")
+            return False
+        seen.append(key)  # запоминаем и отклонённые, чтобы не гонять модель повторно
+        if result == SKIP:
+            log(f"  не подходит: {title}")
+            continue
+        headline, body = result
+        post = f"<b>{esc(headline)}</b>\n\n{esc(body)}"
+        if SOURCE_LINK_SERVICE:
+            post += f"\n\n<a href=\"{esc(key)}\">Источник</a>"
         try:
-            send_text(post)
+            send_text(post, preview=False)
         except Exception as ex:  # noqa: BLE001
             log(f"  не отправилось: {ex}")
+            seen.pop()
             continue
-        seen.append(key)
-        log(f"  опубликовано: {title}")
+        log(f"  опубликовано: {headline}")
         return True
     return False
 
@@ -256,7 +324,9 @@ def run_humor(seen):
                 break
             attempts += 1
             title = strip_html(e.get("title", ""))
-            caption = f"<b>{esc(title)}</b>\n\n<a href=\"{esc(key)}\">Источник</a>"
+            caption = f"<b>{esc(title)}</b>"
+            if SOURCE_LINK_HUMOR:
+                caption += f"\n\n<a href=\"{esc(key)}\">Источник</a>"
             seen.append(key)  # помечаем сразу: битую картинку повторно не пробуем
             seen_set.add(key)
             try:
@@ -274,7 +344,9 @@ def run_humor(seen):
             text = strip_html(e.get("summary", "")) or strip_html(e.get("title", ""))
             if not (20 <= len(text) <= 900):
                 continue
-            post = f"{esc(text)}\n\n<a href=\"{esc(key)}\">Источник</a>"
+            post = esc(text)
+            if SOURCE_LINK_HUMOR:
+                post += f"\n\n<a href=\"{esc(key)}\">Источник</a>"
             try:
                 send_text(post, preview=False)
             except Exception as ex:  # noqa: BLE001
@@ -316,6 +388,9 @@ def main():
     rubric = pick_rubric()
     log(f"Рубрика: {rubric}")
     posted = run_service(seen) if rubric == "service" else run_humor(seen)
+    if not posted and rubric == "service":
+        log("  сервисов нет, публикуем юмор, чтобы слот не пропал")
+        posted = run_humor(seen)
     save_state(seen)
     if not posted:
         log("::warning::Ничего не опубликовано: нет новых подходящих записей или ленты недоступны")
