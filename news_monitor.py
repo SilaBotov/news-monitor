@@ -41,7 +41,7 @@ ARTICLE_CHARS = 4000    # сколько текста статьи отдаём 
 
 # Добавлять ли в пост строку «Источник» со ссылкой
 SOURCE_LINK_SERVICE = False   # рубрика «сервисы»: False = готовый пост без ссылки
-SOURCE_LINK_HUMOR = True      # рубрика «юмор»: подпись «Источник» под мемом
+SOURCE_LINK_HUMOR = False     # рубрика «юмор»: True = подпись «Источник» под мемом
 
 SKIP = "SKIP"           # модель решила, что материал не подходит
 
@@ -215,8 +215,29 @@ def parse_post(content):
         return None
     headline = re.sub(r"^(заголовок|название)\s*:\s*", "", lines[0], flags=re.IGNORECASE)
     headline = headline.strip(" «»\"'")
-    body = "\n\n".join(lines[1:]) if len(lines) > 2 else lines[1]
+    body = "\n\n".join(lines[1:])
+    body = split_paragraphs(body)
     return (headline, body) if headline and body else None
+
+
+def split_paragraphs(body):
+    """Если модель дала сплошной текст, разбиваем его на абзацы по 1-2 предложения."""
+    if "\n\n" in body:
+        return body
+    sentences = re.split(r"(?<=[.!?…])\s+", body.strip())
+    if len(sentences) < 3:
+        return body
+    size = 2 if len(sentences) <= 6 else 3
+    chunks = [" ".join(sentences[i:i + size]) for i in range(0, len(sentences), size)]
+    return "\n\n".join(chunks)
+
+
+def text_with_breaks(s):
+    """Как strip_html, но сохраняет переносы строк (для шуток-диалогов)."""
+    s = re.sub(r"(?i)<br\s*/?>|</p>|</div>", "\n", s or "")
+    s = html.unescape(re.sub(r"<[^>]+>", "", s))
+    lines = [re.sub(r"[ \t\xa0]+", " ", ln).strip() for ln in s.splitlines()]
+    return "\n".join(ln for ln in lines if ln)
 
 
 def groq_post(title, text):
@@ -244,8 +265,9 @@ def groq_post(title, text):
         "«читайте далее»:\n"
         "- первая строка: короткий заголовок до 70 символов, без кавычек и разметки;\n"
         "- пустая строка;\n"
-        "- 3-5 предложений (400-700 символов): что это за сервис или приём, что он умеет, "
-        "кому и чем полезен в работе;\n"
+        "- основной текст 400-700 символов из ТРЁХ коротких абзацев, между абзацами пустая "
+        "строка: 1) что это за сервис или приём; 2) что он умеет, 2-3 главные возможности; "
+        "3) кому и чем полезен в работе;\n"
         "- используй только факты из текста, не выдумывай цифры, цены, названия и функции;\n"
         "- без хэштегов, без эмодзи, без разметки Markdown.\n\n"
         f"Материал:\n{title}\n{text}"
@@ -398,7 +420,7 @@ def run_humor(seen):
             key = entry_key(e)
             if not key or key in seen_set:
                 continue
-            text = strip_html(e.get("summary", "")) or strip_html(e.get("title", ""))
+            text = text_with_breaks(e.get("summary", "")) or strip_html(e.get("title", ""))
             if not (20 <= len(text) <= 900):
                 continue
             post = esc(text)
