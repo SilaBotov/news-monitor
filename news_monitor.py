@@ -171,6 +171,28 @@ def article_text(entry, fallback):
     return fallback[:ARTICLE_CHARS]
 
 
+OG_IMG_RE = re.compile(
+    r"""<meta[^>]+(?:property|name)=["']og:image["'][^>]+content=["']([^"']+)["']"""
+    r"""|<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["']og:image["']""",
+    re.IGNORECASE,
+)
+
+
+def page_image(link):
+    """Картинка статьи из og:image на её странице (запасной вариант)."""
+    try:
+        r = requests.get(link, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT)
+        r.raise_for_status()
+        m = OG_IMG_RE.search(r.text)
+        if m:
+            url = html.unescape(m.group(1) or m.group(2))
+            if _is_http(url):
+                return url
+    except Exception as e:  # noqa: BLE001
+        log(f"  og:image не получить: {type(e).__name__}: {e}")
+    return None
+
+
 def parse_post(content):
     """Ответ модели -> (заголовок, текст) или SKIP или None."""
     content = (content or "").strip()
@@ -293,15 +315,31 @@ def run_service(seen):
         post = f"<b>{esc(headline)}</b>\n\n{esc(body)}"
         if SOURCE_LINK_SERVICE:
             post += f"\n\n<a href=\"{esc(key)}\">Источник</a>"
+        img = find_image(e) or page_image(key)
         try:
-            send_text(post, preview=False)
+            send_service_post(post, img)
         except Exception as ex:  # noqa: BLE001
             log(f"  не отправилось: {ex}")
             seen.pop()
             continue
-        log(f"  опубликовано: {headline}")
+        log(f"  опубликовано: {headline} (картинка: {'да' if img else 'нет'})")
         return True
     return False
+
+
+def send_service_post(post, img):
+    """Пост с картинкой-превью; если картинка не принялась или текст длинный, подстраиваемся."""
+    if img:
+        try:
+            if len(post) <= 1024:
+                send_photo(img, post)          # фото и текст одним сообщением
+            else:
+                send_photo(img, "")            # длинный текст: фото, затем текст
+                send_text(post, preview=False)
+            return
+        except Exception as ex:  # noqa: BLE001
+            log(f"  картинка не принялась ({ex}), отправляю без неё")
+    send_text(post, preview=False)
 
 
 def run_humor(seen):
