@@ -383,6 +383,55 @@ def send_service_post(post, img):
     send_text(post, preview=False)
 
 
+# Темы, которым не место в юмористической рубрике (проверяется по заголовку, описанию и тегам)
+BLOCK_RE = re.compile(
+    r"суицид|самоубий|покончил|погиб|умер|умерл|скончал|смерт|убий|убит|убил|труп|"
+    r"трагед|следстви|\bск\b|полиц|задержан|арест|\bсуд\b|приговор|уголовн|преступлен|"
+    r"теракт|взрыв|обстрел|войн|\bсво\b|украин|мобилиз|фронт|насили|изнасил|педофил|"
+    r"школьниц|\bдтп\b|аварi|авари|катастроф|пожар|жертв|траур|похорон|"
+    r"политик|путин|депутат|выборы|санкци|новости|происшеств|криминал|скандал|"
+    r"заявлени|онколог|диагноз|больниц|трамп|зеленск|мигрант",
+    re.IGNORECASE,
+)
+
+
+def is_blocked(entry, *texts):
+    tags = " ".join(t.get("term", "") for t in (entry.get("tags") or []) if isinstance(t, dict))
+    return bool(BLOCK_RE.search(" ".join([*texts, tags])))
+
+
+def groq_humor_ok(title, text):
+    """Вторая проверка моделью: безобидный ли это юмор. Если Groq недоступен, пропускаем (True)."""
+    key = os.getenv("GROQ_API_KEY_NEWS")
+    if not key:
+        return True
+    prompt = (
+        "Канал про IT и офисную жизнь для предпринимателей и сотрудников. Нужен лёгкий "
+        "безобидный юмор: шутки, мемы, забавные истории.\n"
+        "Ответь одним словом: SKIP, если материал про смерть, самоубийство, насилие, "
+        "преступления, аварии, болезни, войну, политику, скандалы с реальными людьми, "
+        "новости, либо это не шутка, либо неприлично. Иначе ответь одним словом: OK.\n\n"
+        f"Заголовок: {title}\nТекст: {text[:800]}"
+    )
+    body = {"model": GROQ_MODEL, "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0, "max_tokens": 300}
+    if "gpt-oss" in GROQ_MODEL:
+        body["reasoning_effort"] = "low"
+        body["max_tokens"] = 1000
+    try:
+        r = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {key}"}, json=body, timeout=30,
+        )
+        if not r.ok:
+            raise RuntimeError(f"{r.status_code} {r.text[:200]}")
+        answer = (r.json()["choices"][0]["message"]["content"] or "").strip().upper()
+        return not answer.startswith("SKIP")
+    except Exception as e:  # noqa: BLE001
+        log(f"  проверка юмора моделью не удалась: {type(e).__name__}: {e}")
+        return True
+
+
 def run_humor(seen):
     seen_set = set(seen)
     image_feeds = [f for f in HUMOR_FEEDS if f["kind"] == "image"]
@@ -399,10 +448,19 @@ def run_humor(seen):
             img = find_image(e)
             if not img:
                 continue
+            title = strip_html(e.get("title", ""))
+            summary = strip_html(e.get("summary", ""))
+            if is_blocked(e, title, summary):
+                log(f"  отклонено фильтром тем: {title}")
+                continue
             if attempts >= MAX_ATTEMPTS:
                 break
             attempts += 1
-            title = strip_html(e.get("title", ""))
+            if not groq_humor_ok(title, summary):
+                log(f"  отклонено моделью: {title}")
+                seen.append(key)
+                seen_set.add(key)
+                continue
             caption = f"<b>{esc(title)}</b>"
             if SOURCE_LINK_HUMOR:
                 caption += f"\n\n<a href=\"{esc(key)}\">Источник</a>"
@@ -410,7 +468,7 @@ def run_humor(seen):
             seen_set.add(key)
             try:
                 send_photo(img, caption)
-                log(f"  мем опубликован: {title}")
+                log(f"  мем опубликован: {title} | {key}")
                 return True
             except Exception as ex:  # noqa: BLE001
                 log(f"  картинка не принялась: {ex}")
@@ -422,6 +480,9 @@ def run_humor(seen):
                 continue
             text = text_with_breaks(e.get("summary", "")) or strip_html(e.get("title", ""))
             if not (20 <= len(text) <= 900):
+                continue
+            if is_blocked(e, text) or not groq_humor_ok("Шутка", text):
+                log("  шутка отклонена фильтром")
                 continue
             post = esc(text)
             if SOURCE_LINK_HUMOR:
