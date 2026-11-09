@@ -185,6 +185,13 @@ PROMO_RE = re.compile(
     re.IGNORECASE,
 )
 
+# t.me отдаёт разметку одинаково всем, но с «браузерным» UA меньше шансов попасть
+# на заглушку или в лимит, поэтому для канала используется отдельный User-Agent
+TG_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
 TG_POST_SPLIT_RE = re.compile(r'(?=<div class="tgme_widget_message[^"]*"\s+data-post=)')
 TG_PHOTO_RE = re.compile(
     r"""tgme_widget_message_photo_wrap[^>]*?background-image:url\('([^']+)'\)""", re.S
@@ -237,42 +244,42 @@ def tg_caption(text_html):
     return " ".join(lines)[:900]
 
 
-def tg_get(url):
-    """HTML веб-превью канала; при неудаче — повтор через TG_PROXY (если задан)."""
-    try:
-        r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT)
-        r.raise_for_status()
-        return r.text
-    except Exception as e:  # noqa: BLE001
-        if not TG_PROXY:
-            log(f"  канал недоступен: {url} ({type(e).__name__}: {e})")
-            return None
-        # публичные прокси отвечают медленно и иногда с первого раза отдают 5xx
-        error = e
-        for _ in range(2):
-            try:
-                r = requests.get(
-                    TG_PROXY.format(url=quote(url, safe="")),
-                    headers={"User-Agent": USER_AGENT},
-                    timeout=max(TIMEOUT, 45),
-                )
-                r.raise_for_status()
-                log(f"  канал открыт через прокси: {url}")
-                return r.text
-            except Exception as e2:  # noqa: BLE001
-                error = e2
-        log(f"  канал недоступен: {url} ({type(error).__name__}: {error})")
+def tg_get(url, proxy=False):
+    """HTML веб-превью канала: напрямую, а при неудаче или force_proxy — через TG_PROXY."""
+    error = None
+    if not proxy:
+        try:
+            r = requests.get(url, headers={"User-Agent": TG_UA}, timeout=TIMEOUT)
+            r.raise_for_status()
+            return r.text
+        except Exception as e:  # noqa: BLE001
+            error = e
+            if not TG_PROXY:
+                log(f"  канал недоступен: {url} ({type(e).__name__}: {e})")
+                return None
+    if not TG_PROXY:
         return None
+    # публичные прокси отвечают медленно и иногда с первого раза отдают 5xx
+    for _ in range(2):
+        try:
+            r = requests.get(
+                TG_PROXY.format(url=quote(url, safe="")),
+                headers={"User-Agent": TG_UA},
+                timeout=max(TIMEOUT, 45),
+            )
+            r.raise_for_status()
+            log(f"  канал открыт через прокси: {url}")
+            return r.text
+        except Exception as e2:  # noqa: BLE001
+            error = e2
+    log(f"  канал недоступен: {url} ({type(error).__name__}: {error})")
+    return None
 
 
-def fetch_tg_posts(channel_url):
-    """Посты канала: {link, img, likes, views, text, published}. Только картинки."""
-    url = tg_preview_url(channel_url)
-    page = tg_get(url)
-    if page is None:
-        return []
+def parse_tg_page(page):
+    """Посты из HTML веб-превью: {link, img, likes, views, text, published}."""
     posts = []
-    for chunk in TG_POST_SPLIT_RE.split(page)[1:]:
+    for chunk in TG_POST_SPLIT_RE.split(page or "")[1:]:
         m_post = re.search(r'data-post="([^"]+)"', chunk)
         m_img = TG_PHOTO_RE.search(chunk)
         # sendPhoto умеет только картинки: видео и гифки этой рубрикой не берём
@@ -294,6 +301,22 @@ def fetch_tg_posts(channel_url):
             "text": tg_caption(m_text.group(1) if m_text else ""),
             "published": _parse_time(m_time.group(1)) if m_time else None,
         })
+    if not posts:
+        markup = "разметка распознана" if "tgme_widget_message" in (page or "") else "разметка не распознана"
+        log(f"  в превью нет постов с фото (страница {len(page or '')} байт, {markup})")
+    return posts
+
+
+def fetch_tg_posts(channel_url):
+    """Посты канала с картинками; если напрямую ничего не вышло — пробуем через прокси."""
+    url = tg_preview_url(channel_url)
+    page = tg_get(url)
+    if page is None:
+        return []
+    posts = parse_tg_page(page)
+    if not posts and TG_PROXY:
+        page = tg_get(url, proxy=True)
+        posts = parse_tg_page(page) if page else []
     return posts
 
 
