@@ -56,9 +56,11 @@ SERVICE_FEEDS = [
     "https://tproger.ru/feed",
 ]
 
+# kind="image": берём картинку из записи; kind="text": запасной вариант, текстовая шутка.
+# Pikabu «горячее» убран 09.11.2026: в популярное попал комикс с оскорблениями по
+# национальному признаку (pikabu.ru/story/vnimanie_14506494), фильтры его не отсекли.
+# Источников с картинками сейчас нет — рубрика юмора публикует текстовые шутки.
 HUMOR_FEEDS = [
-    # kind="image": берём картинку из записи; kind="text": запасной вариант, текстовая шутка
-    {"url": "https://pikabu.ru/xmlfeeds.php?cmd=popular", "kind": "image"},
     {"url": "https://www.anekdot.ru/rss/export_j.xml", "kind": "text"},
 ]
 
