@@ -3,7 +3,7 @@
 
 Рубрики (по слоту времени МСК):
   9:00 -> service: полезный сервис/инструмент для работы (готовый пост от Groq)
-  12:00, 15:00, 18:00, 21:00 -> humor: мем с картинкой (или текстовая шутка)
+  6:00, 12:00, 15:00, 18:00 -> humor: мем с картинкой (или текстовая шутка)
 
 Запуск:
   python news_monitor.py          # опубликовать один пост
@@ -20,8 +20,9 @@ import os
 import random
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import feedparser
@@ -46,7 +47,7 @@ SOURCE_LINK_HUMOR = False     # рубрика «юмор»: True = подпис
 SKIP = "SKIP"           # модель решила, что материал не подходит
 
 # Слоты по московскому времени -> рубрика
-SLOTS = {9: "service", 12: "humor", 15: "humor", 18: "humor", 21: "humor"}
+SLOTS = {6: "humor", 9: "service", 12: "humor", 15: "humor", 18: "humor"}
 
 # ВАЖНО: адреса лент не проверены с серверов GitHub. Запусти режим check
 # (см. workflow) и убери/замени те, что не отвечают.
@@ -59,10 +60,25 @@ SERVICE_FEEDS = [
 # kind="image": берём картинку из записи; kind="text": запасной вариант, текстовая шутка.
 # Pikabu «горячее» убран 09.11.2026: в популярное попал комикс с оскорблениями по
 # национальному признаку (pikabu.ru/story/vnimanie_14506494), фильтры его не отсекли.
-# Источников с картинками сейчас нет — рубрика юмора публикует текстовые шутки.
 HUMOR_FEEDS = [
     {"url": "https://www.anekdot.ru/rss/export_j.xml", "kind": "text"},
 ]
+
+# Телеграм-каналы с мемами. Лайки и статистику берём из веб-превью t.me/s/<канал>:
+# там у каждого поста есть реакции и просмотры. Канал читается без авторизации и без
+# Bot API, но t.me не отвечает с части российских провайдеров — с GitHub-раннеров работает.
+TG_HUMOR_FEEDS = [
+    "https://t.me/package_memes",
+]
+TG_MAX_AGE_HOURS = 72   # берём только посты не старше этого возраста
+TG_MIN_LIKES = 40       # минимум лайков (сумма реакций), чтобы мем ушёл в канал
+TG_TOP_N = 3            # сколько лучших по лайкам постов пробуем за запуск
+TG_SOURCE_LINK = False  # подпись со ссылкой на оригинальный пост в канале: не ставим
+
+# Необязательный прокси на случай, когда t.me не открывается с текущей сети
+# (у российских провайдеров бывает). Шаблон: {url} в URL-кодировке.
+# Пример: TG_PROXY="https://api.allorigins.win/raw?url={url}"
+TG_PROXY = os.getenv("TG_PROXY", "").strip()
 
 # Что считаем «полезным сервисом» (фильтр до модели, чтобы не тратить лимит Groq)
 SERVICE_RE = re.compile(
@@ -159,6 +175,169 @@ def find_image(entry):
             if _is_http(url):
                 return url
     return None
+
+
+# ---------------------------------------------------------------- телеграм-каналы
+
+# Служебный текст под мемами канала-источника: в подписи нашего канала он не нужен
+PROMO_RE = re.compile(
+    r"пакет по итэ|другие каналы|проекты|чатик|подписывайтесь|реклама",
+    re.IGNORECASE,
+)
+
+TG_POST_SPLIT_RE = re.compile(r'(?=<div class="tgme_widget_message[^"]*"\s+data-post=)')
+TG_PHOTO_RE = re.compile(
+    r"""tgme_widget_message_photo_wrap[^>]*?background-image:url\('([^']+)'\)""", re.S
+)
+TG_VIEWS_RE = re.compile(r'tgme_widget_message_views">([^<]+)<')
+TG_TIME_RE = re.compile(r'<time datetime="([^"]+)"')
+TG_TEXT_RE = re.compile(r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', re.S)
+TG_REACTION_RE = re.compile(r'<span class="tgme_reaction">.*?</i>([^<]*)</span>', re.S)
+
+
+def _num(value):
+    """'4.5K' -> 4500, '1,2M' -> 1200000, '120' -> 120."""
+    s = str(value or "").strip().replace("\xa0", "").replace(" ", "")
+    m = re.match(r"^([\d.,]+)\s*([KkMмКк]?)$", s)
+    if not m:
+        return 0
+    mult = {"k": 1000, "к": 1000, "m": 1_000_000, "м": 1_000_000}.get(m.group(2).lower(), 1)
+    try:
+        return int(float(m.group(1).replace(",", ".")) * mult)
+    except ValueError:
+        return 0
+
+
+def _parse_time(value):
+    try:
+        dt = datetime.fromisoformat((value or "").replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def tg_preview_url(channel_url):
+    """https://t.me/name -> https://t.me/s/name: веб-превью канала без авторизации."""
+    m = re.match(r"https?://t\.me/(?:s/)?([A-Za-z0-9_]+)/?$", channel_url)
+    return f"https://t.me/s/{m.group(1)}" if m else channel_url
+
+
+def tg_caption(text_html):
+    """Подпись мема: без ссылок, тегов, хэштегов и промо-строк канала-источника."""
+    s = re.sub(r"(?is)<tg-emoji[^>]*>.*?</tg-emoji>", "", text_html or "")
+    s = re.sub(r"(?is)<a [^>]*>(.*?)</a>", r"\1", s)
+    s = re.sub(r"(?is)<br\s*/?>", "\n", s)
+    s = html.unescape(re.sub(r"<[^>]+>", "", s))
+    lines = []
+    for ln in s.splitlines():
+        ln = re.sub(r"[ \t\xa0]+", " ", ln).strip()
+        if len(ln) < 4 or ln.startswith("#") or PROMO_RE.search(ln):
+            continue
+        lines.append(ln)
+    return " ".join(lines)[:900]
+
+
+def tg_get(url):
+    """HTML веб-превью канала; при неудаче — повтор через TG_PROXY (если задан)."""
+    try:
+        r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT)
+        r.raise_for_status()
+        return r.text
+    except Exception as e:  # noqa: BLE001
+        if not TG_PROXY:
+            log(f"  канал недоступен: {url} ({type(e).__name__}: {e})")
+            return None
+        # публичные прокси отвечают медленно и иногда с первого раза отдают 5xx
+        error = e
+        for _ in range(2):
+            try:
+                r = requests.get(
+                    TG_PROXY.format(url=quote(url, safe="")),
+                    headers={"User-Agent": USER_AGENT},
+                    timeout=max(TIMEOUT, 45),
+                )
+                r.raise_for_status()
+                log(f"  канал открыт через прокси: {url}")
+                return r.text
+            except Exception as e2:  # noqa: BLE001
+                error = e2
+        log(f"  канал недоступен: {url} ({type(error).__name__}: {error})")
+        return None
+
+
+def fetch_tg_posts(channel_url):
+    """Посты канала: {link, img, likes, views, text, published}. Только картинки."""
+    url = tg_preview_url(channel_url)
+    page = tg_get(url)
+    if page is None:
+        return []
+    posts = []
+    for chunk in TG_POST_SPLIT_RE.split(page)[1:]:
+        m_post = re.search(r'data-post="([^"]+)"', chunk)
+        m_img = TG_PHOTO_RE.search(chunk)
+        # sendPhoto умеет только картинки: видео и гифки этой рубрикой не берём
+        if not m_post or not m_img or "tgme_widget_message_video" in chunk:
+            continue
+        img = html.unescape(m_img.group(1))
+        if img.startswith("//"):
+            img = "https:" + img
+        if not _is_http(img):
+            continue
+        m_text = TG_TEXT_RE.search(chunk)
+        m_time = TG_TIME_RE.search(chunk)
+        m_views = TG_VIEWS_RE.search(chunk)
+        posts.append({
+            "link": f"https://t.me/{m_post.group(1)}",
+            "img": img,
+            "likes": sum(_num(x) for x in TG_REACTION_RE.findall(chunk)),
+            "views": _num(m_views.group(1)) if m_views else 0,
+            "text": tg_caption(m_text.group(1) if m_text else ""),
+            "published": _parse_time(m_time.group(1)) if m_time else None,
+        })
+    return posts
+
+
+def run_tg_humor(seen):
+    """Лучший по лайкам свежий мем из телеграм-каналов."""
+    seen_set = set(seen)
+    now = datetime.now(timezone.utc)
+    candidates = []
+    for channel_url in TG_HUMOR_FEEDS:
+        posts = fetch_tg_posts(channel_url)
+        log(f"  канал {channel_url}: картинок {len(posts)}")
+        for p in posts:
+            if not p["published"] or p["link"] in seen_set:
+                continue
+            if p["likes"] < TG_MIN_LIKES:
+                continue
+            age_hours = (now - p["published"]).total_seconds() / 3600
+            if age_hours > TG_MAX_AGE_HOURS:
+                continue
+            candidates.append(p)
+    if not candidates:
+        log(f"  нет свежих мемов с {TG_MIN_LIKES}+ лайками")
+        return False
+    candidates.sort(key=lambda p: p["likes"], reverse=True)
+    log("  топ по лайкам: " + "; ".join(
+        f"{p['likes']}♥ {p['views']}👁 {p['link'].rsplit('/', 1)[-1]}"
+        for p in candidates[:TG_TOP_N]
+    ))
+    for p in candidates[:TG_TOP_N]:
+        if is_blocked({}, p["text"]) or (p["text"] and not groq_humor_ok("Мем", p["text"])):
+            log(f"  отклонено фильтром: {p['link']}")
+            continue
+        caption = esc(p["text"])
+        if TG_SOURCE_LINK:
+            caption += ('\n\n' if caption else '') + f'<a href="{esc(p["link"])}">источник</a>'
+        try:
+            send_photo(p["img"], caption)
+        except Exception as ex:  # noqa: BLE001
+            log(f"  картинка не принялась: {ex}")
+            continue
+        seen.append(p["link"])
+        log(f"  мем опубликован: {p['link']} (лайков {p['likes']})")
+        return True
+    return False
 
 
 # ---------------------------------------------------------------- Groq
@@ -442,6 +621,9 @@ def run_humor(seen):
     random.shuffle(text_feeds)
     attempts = 0
 
+    if run_tg_humor(seen):
+        return True
+
     for feed in image_feeds:
         for e in fetch_feed(feed["url"]):
             key = entry_key(e)
@@ -520,6 +702,10 @@ def check_feeds():
         with_img = sum(1 for e in entries if find_image(e))
         first = strip_html(entries[0].get("title", ""))[:60] if entries else "-"
         log(f"[{label}] {url}\n    записей: {len(entries)}, с картинкой: {with_img}, первая: {first}")
+    for url in TG_HUMOR_FEEDS:
+        posts = fetch_tg_posts(url)
+        likes = sorted((p["likes"] for p in posts), reverse=True)[:5]
+        log(f"[humor/tg] {url}\n    картинок: {len(posts)}, лайки топ-5: {likes}")
     return 0
 
 
