@@ -45,6 +45,8 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GROQ_API_KEY_NEWS: ${{ secrets.GROQ_API_KEY_NEWS }}
+          # Необязательно: прокси для t.me, если раннер его не видит (пустой = не используется)
+          TG_PROXY: ${{ secrets.TG_PROXY }}
           RUBRIC: ${{ inputs.rubric }}
         run: |
           if [ "${{ inputs.mode }}" = "check" ]; then
