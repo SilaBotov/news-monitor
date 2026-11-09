@@ -2,8 +2,8 @@ name: news-monitor
 
 on:
   schedule:
-    # UTC. Это 9:00, 12:00, 15:00, 18:00, 21:00 по Москве
-    - cron: "0 6,9,12,15,18 * * *"
+    # UTC. Это 6:00, 9:00, 12:00, 15:00, 18:00 по Москве
+    - cron: "0 3,6,9,12,15 * * *"
   workflow_dispatch:
     inputs:
       mode:
