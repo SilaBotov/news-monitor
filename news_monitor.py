@@ -67,8 +67,12 @@ HUMOR_FEEDS = [
 # Телеграм-каналы с мемами. Лайки и статистику берём из веб-превью t.me/s/<канал>:
 # там у каждого поста есть реакции и просмотры. Канал читается без авторизации и без
 # Bot API, но t.me не отвечает с части российских провайдеров — с GitHub-раннеров работает.
+# Каналы ранжируются вместе по абсолютному числу лайков: у обоих порядок величин один
+# (десятки-сотни реакций на пост), но если один начнёт забирать все слоты — нормализуем
+# лайки на медиану своего канала.
 TG_HUMOR_FEEDS = [
-    "https://t.me/package_memes",
+    "https://t.me/package_memes",   # «пакет по итэ»: 1-2 мема в день, ~130 лайков
+    "https://t.me/iIT_Mems",        # «За минуту до созвона»: 1-2 мема в день, ~145 лайков
 ]
 TG_MAX_AGE_HOURS = 72   # берём только посты не старше этого возраста
 TG_MIN_LIKES = 40       # минимум лайков (сумма реакций), чтобы мем ушёл в канал
@@ -181,7 +185,7 @@ def find_image(entry):
 
 # Служебный текст под мемами канала-источника: в подписи нашего канала он не нужен
 PROMO_RE = re.compile(
-    r"пакет по итэ|другие каналы|проекты|чатик|подписывайтесь|реклама",
+    r"пакет по итэ|другие каналы|проекты|чатик|подписывайтесь|реклама|за минуту до созвона",
     re.IGNORECASE,
 )
 
@@ -196,6 +200,9 @@ TG_POST_SPLIT_RE = re.compile(r'(?=<div class="tgme_widget_message[^"]*"\s+data-
 TG_PHOTO_RE = re.compile(
     r"""tgme_widget_message_photo_wrap[^>]*?background-image:url\('([^']+)'\)""", re.S
 )
+# В class фото-обёртки t.me кладёт id файла: по нему видно, что один и тот же мем
+# пришёл из двух разных каналов (при пересылке id файла сохраняется)
+TG_DOC_RE = re.compile(r'tgme_widget_message_photo_wrap\s+(\d+)\s+[0-9_]+')
 TG_VIEWS_RE = re.compile(r'tgme_widget_message_views">([^<]+)<')
 TG_TIME_RE = re.compile(r'<time datetime="([^"]+)"')
 TG_TEXT_RE = re.compile(r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', re.S)
@@ -250,6 +257,7 @@ def tg_get(url, proxy=False):
     if not proxy:
         try:
             r = requests.get(url, headers={"User-Agent": TG_UA}, timeout=TIMEOUT)
+            log(f"  канал {url}: HTTP {r.status_code}, {len(r.content)} байт")
             r.raise_for_status()
             return r.text
         except Exception as e:  # noqa: BLE001
@@ -267,6 +275,7 @@ def tg_get(url, proxy=False):
                 headers={"User-Agent": TG_UA},
                 timeout=max(TIMEOUT, 45),
             )
+            log(f"  канал через прокси: HTTP {r.status_code}, {len(r.content)} байт")
             r.raise_for_status()
             log(f"  канал открыт через прокси: {url}")
             return r.text
@@ -277,7 +286,7 @@ def tg_get(url, proxy=False):
 
 
 def parse_tg_page(page):
-    """Посты из HTML веб-превью: {link, img, likes, views, text, published}."""
+    """Посты из HTML веб-превью: {link, img, likes, views, text, doc, published}."""
     posts = []
     for chunk in TG_POST_SPLIT_RE.split(page or "")[1:]:
         m_post = re.search(r'data-post="([^"]+)"', chunk)
@@ -293,12 +302,15 @@ def parse_tg_page(page):
         m_text = TG_TEXT_RE.search(chunk)
         m_time = TG_TIME_RE.search(chunk)
         m_views = TG_VIEWS_RE.search(chunk)
+        # id файла в разметке: по нему ловим один и тот же мем из разных каналов
+        m_doc = TG_DOC_RE.search(chunk)
         posts.append({
             "link": f"https://t.me/{m_post.group(1)}",
             "img": img,
             "likes": sum(_num(x) for x in TG_REACTION_RE.findall(chunk)),
             "views": _num(m_views.group(1)) if m_views else 0,
             "text": tg_caption(m_text.group(1) if m_text else ""),
+            "doc": m_doc.group(1) if m_doc else "",
             "published": _parse_time(m_time.group(1)) if m_time else None,
         })
     if not posts:
@@ -320,6 +332,11 @@ def fetch_tg_posts(channel_url):
     return posts
 
 
+def tg_short(link):
+    """https://t.me/package_memes/2890 -> package_memes/2890 (для лога)."""
+    return (link or "").replace("https://t.me/", "", 1)
+
+
 def run_tg_humor(seen):
     """Лучший по лайкам свежий мем из телеграм-каналов."""
     seen_set = set(seen)
@@ -330,6 +347,8 @@ def run_tg_humor(seen):
         log(f"  канал {channel_url}: картинок {len(posts)}")
         for p in posts:
             if not p["published"] or p["link"] in seen_set:
+                continue
+            if p["doc"] and f"tgdoc:{p['doc']}" in seen_set:   # этот же файл уже постили
                 continue
             if p["likes"] < TG_MIN_LIKES:
                 continue
@@ -342,7 +361,7 @@ def run_tg_humor(seen):
         return False
     candidates.sort(key=lambda p: p["likes"], reverse=True)
     log("  топ по лайкам: " + "; ".join(
-        f"{p['likes']}♥ {p['views']}👁 {p['link'].rsplit('/', 1)[-1]}"
+        f"{p['likes']}♥ {p['views']}👁 {tg_short(p['link'])}"
         for p in candidates[:TG_TOP_N]
     ))
     for p in candidates[:TG_TOP_N]:
@@ -358,6 +377,8 @@ def run_tg_humor(seen):
             log(f"  картинка не принялась: {ex}")
             continue
         seen.append(p["link"])
+        if p["doc"]:
+            seen.append(f"tgdoc:{p['doc']}")
         log(f"  мем опубликован: {p['link']} (лайков {p['likes']})")
         return True
     return False
@@ -521,8 +542,61 @@ def send_text(text, preview=True):
     })
 
 
+MAX_PHOTO_BYTES = 9 * 1024 * 1024   # запас под лимит Telegram в 10 МБ
+
+
+def fetch_image_bytes(url):
+    """Скачивает картинку по ссылке: Telegram не всегда может забрать её сам."""
+    headers = {"User-Agent": TG_UA}
+    if "telesco" in url:      # CDN веб-превью отдаёт файл охотнее с Referer'ом
+        headers["Referer"] = "https://t.me/"
+    try:
+        r = requests.get(url, headers=headers, timeout=TIMEOUT)
+        r.raise_for_status()
+        ctype = str(r.headers.get("content-type", ""))
+        if not ctype.startswith("image"):
+            log(f"  по ссылке не картинка ({ctype}), пропускаю")
+            return None
+        if len(r.content) > MAX_PHOTO_BYTES:
+            log(f"  картинка слишком большая ({len(r.content)} байт), пропускаю")
+            return None
+        return r.content
+    except Exception as e:  # noqa: BLE001
+        log(f"  картинку не скачать: {type(e).__name__}: {e}")
+        return None
+
+
+def send_photo_bytes(data, caption):
+    """Отправляет картинку файлом (multipart), а не ссылкой."""
+    token = os.environ["TELEGRAM_BOT_TOKEN"]
+    payload = {"chat_id": os.environ["TELEGRAM_CHAT_ID"], "caption": caption[:1024]}
+    if caption:
+        payload["parse_mode"] = "HTML"
+    r = requests.post(
+        f"https://api.telegram.org/bot{token}/sendPhoto",
+        data=payload,
+        files={"photo": ("meme.jpg", data)},
+        timeout=60,
+    )
+    if not r.ok:
+        raise RuntimeError(f"sendPhoto файлом: {r.status_code} {r.text[:200]}")
+
+
 def send_photo(url, caption):
-    tg("sendPhoto", {"photo": url, "caption": caption[:1024], "parse_mode": "HTML"})
+    """Фото ссылкой; если Telegram не смог её забрать — качаем сами и грузим файлом."""
+    payload = {"photo": url, "caption": caption[:1024]}
+    if caption:
+        payload["parse_mode"] = "HTML"
+    try:
+        tg("sendPhoto", payload)
+        return
+    except Exception as ex:  # noqa: BLE001
+        log(f"  Telegram не принял ссылку ({ex}), пробую загрузить файлом")
+    data = fetch_image_bytes(url)
+    if not data:
+        raise RuntimeError("картинку не удалось ни отправить ссылкой, ни скачать")
+    send_photo_bytes(data, caption)
+    log("  картинка ушла файлом")
 
 
 def esc(s):
