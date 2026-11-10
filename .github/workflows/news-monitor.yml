@@ -49,18 +49,21 @@ jobs:
           TG_PROXY: ${{ secrets.TG_PROXY }}
           RUBRIC: ${{ inputs.rubric }}
         run: |
+          set -o pipefail
           if [ "${{ inputs.mode }}" = "check" ]; then
-            python news_monitor.py --check
+            python news_monitor.py --check 2>&1 | tee last_run.log
           else
-            python news_monitor.py
+            python news_monitor.py 2>&1 | tee last_run.log
           fi
 
       - name: Commit state
-        if: ${{ inputs.mode != 'check' }}
+        # always(): лог нужен и у упавших запусков, иначе причину не увидеть
+        if: ${{ always() }}
+        continue-on-error: true
         run: |
           git config user.name "news-monitor-bot"
           git config user.email "news-monitor-bot@users.noreply.github.com"
-          git add state.json
+          git add state.json last_run.log 2>/dev/null || true
           if ! git diff --cached --quiet; then
             git commit -m "news-monitor: update state"
             git pull --rebase
