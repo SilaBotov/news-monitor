@@ -1,9 +1,18 @@
-Рубрика: humor
-  канал https://t.me/s/package_memes: HTTP 200, 137962 байт
+Рубрика: service
+  кандидатов: 25
+  не подходит: ИИ оставит человечество без работы. Или мы снова чего-то не учли? Часть 2
+  не подходит: Живая карта мозга нейросети: 48 слоёв, 512 экспертов, одна GTX 1070 + Strata + Qwen3.8-Flash-Next
+  не подходит: Про обиженных криэйторов, или Кто кому должен за нейросеть
+  не подходит: Поймай меня, если с прокси
+  не подходит: Атаки на ИИ-агентов: разбираем проект таксономии NIST
+  Groq не ответил: RuntimeError: 429 {"error":{"message":"Rate limit reached for model `openai/gpt-oss-20b` in organization `org_01m6n5ymnsemmsp7ve1hdq8t0x` service tier `on_demand` on tokens per minute (TPM): Limit 8000, Used 7217, Requested 2180. Please try again in 10.4775s. Need more tokens? Upgrade to Dev Tier today at https://con
+::warning::Groq не дал пост, рубрика сервисов пропущена
+  сервисов нет, публикуем юмор, чтобы слот не пропал
+  канал https://t.me/s/package_memes: HTTP 200, 132387 байт
   канал https://t.me/package_memes: картинок 15
-  канал https://t.me/s/iIT_Mems: HTTP 200, 119703 байт
+  канал https://t.me/s/iIT_Mems: HTTP 200, 119845 байт
   канал https://t.me/iIT_Mems: картинок 20
-  топ по лайкам: 144♥ 2860👁 package_memes/2890; 107♥ 2940👁 iIT_Mems/1537; 102♥ 2710👁 iIT_Mems/1538
+  топ по лайкам: 109♥ 2960👁 iIT_Mems/1537; 104♥ 2740👁 iIT_Mems/1538; 98♥ 2860👁 package_memes/2891
   Telegram не принял ссылку (sendPhoto: 400 {"ok":false,"error_code":400,"description":"Bad Request: failed to get HTTP URL content"}), пробую загрузить файлом
   картинка ушла файлом
-  мем опубликован: https://t.me/package_memes/2890 (лайков 144)
+  мем опубликован: https://t.me/iIT_Mems/1537 (лайков 109)
