@@ -78,6 +78,8 @@ TG_MAX_AGE_HOURS = 72   # берём только посты не старше �
 TG_MIN_LIKES = 40       # минимум лайков (сумма реакций), чтобы мем ушёл в канал
 TG_TOP_N = 3            # сколько лучших по лайкам постов пробуем за запуск
 TG_SOURCE_LINK = False  # подпись со ссылкой на оригинальный пост в канале: не ставим
+TG_MAX_IMAGES = 10      # лимит альбома Telegram; в посте больше фото: пропускаем пост целиком
+                        # (мем из нескольких фото берём ЦЕЛИКОМ или не берём совсем)
 
 # Необязательный прокси на случай, когда t.me не открывается с текущей сети
 # (у российских провайдеров бывает). Шаблон: {url} в URL-кодировке.
@@ -286,31 +288,37 @@ def tg_get(url, proxy=False):
 
 
 def parse_tg_page(page):
-    """Посты из HTML веб-превью: {link, img, likes, views, text, doc, published}."""
+    """Посты из HTML веб-превью: {link, img, imgs, likes, views, text, docs, published}."""
     posts = []
     for chunk in TG_POST_SPLIT_RE.split(page or "")[1:]:
         m_post = re.search(r'data-post="([^"]+)"', chunk)
-        m_img = TG_PHOTO_RE.search(chunk)
-        # sendPhoto умеет только картинки: видео и гифки этой рубрикой не берём
-        if not m_post or not m_img or "tgme_widget_message_video" in chunk:
+        # альбом: в одном посте несколько фото, берём все по порядку без дублей
+        imgs = []
+        for m_img in TG_PHOTO_RE.finditer(chunk):
+            img = html.unescape(m_img.group(1))
+            if img.startswith("//"):
+                img = "https:" + img
+            if _is_http(img) and img not in imgs:
+                imgs.append(img)
+        # видео и гифки этой рубрикой не берём (в том числе внутри альбома: целиком или никак)
+        if not m_post or not imgs or "tgme_widget_message_video" in chunk:
             continue
-        img = html.unescape(m_img.group(1))
-        if img.startswith("//"):
-            img = "https:" + img
-        if not _is_http(img):
+        if len(imgs) > TG_MAX_IMAGES:
+            log(f"  в посте {len(imgs)} фото (больше {TG_MAX_IMAGES}), пропускаю: {m_post.group(1)}")
             continue
         m_text = TG_TEXT_RE.search(chunk)
         m_time = TG_TIME_RE.search(chunk)
         m_views = TG_VIEWS_RE.search(chunk)
-        # id файла в разметке: по нему ловим один и тот же мем из разных каналов
-        m_doc = TG_DOC_RE.search(chunk)
+        # id файлов в разметке: по ним ловим один и тот же мем из разных каналов
+        docs = list(dict.fromkeys(TG_DOC_RE.findall(chunk)))
         posts.append({
             "link": f"https://t.me/{m_post.group(1)}",
-            "img": img,
+            "img": imgs[0],
+            "imgs": imgs,
             "likes": sum(_num(x) for x in TG_REACTION_RE.findall(chunk)),
             "views": _num(m_views.group(1)) if m_views else 0,
             "text": tg_caption(m_text.group(1) if m_text else ""),
-            "doc": m_doc.group(1) if m_doc else "",
+            "docs": docs,
             "published": _parse_time(m_time.group(1)) if m_time else None,
         })
     if not posts:
@@ -348,7 +356,7 @@ def run_tg_humor(seen):
         for p in posts:
             if not p["published"] or p["link"] in seen_set:
                 continue
-            if p["doc"] and f"tgdoc:{p['doc']}" in seen_set:   # этот же файл уже постили
+            if any(f"tgdoc:{d}" in seen_set for d in p["docs"]):   # этот же мем уже постили
                 continue
             if p["likes"] < TG_MIN_LIKES:
                 continue
@@ -361,7 +369,7 @@ def run_tg_humor(seen):
         return False
     candidates.sort(key=lambda p: p["likes"], reverse=True)
     log("  топ по лайкам: " + "; ".join(
-        f"{p['likes']}♥ {p['views']}👁 {tg_short(p['link'])}"
+        f"{p['likes']}♥ {p['views']}👁 {tg_short(p['link'])} ({len(p['imgs'])} фото)"
         for p in candidates[:TG_TOP_N]
     ))
     for p in candidates[:TG_TOP_N]:
@@ -372,14 +380,13 @@ def run_tg_humor(seen):
         if TG_SOURCE_LINK:
             caption += ('\n\n' if caption else '') + f'<a href="{esc(p["link"])}">источник</a>'
         try:
-            send_photo(p["img"], caption)
+            send_photos(p["imgs"], caption)   # альбом уходит целиком или не уходит совсем
         except Exception as ex:  # noqa: BLE001
-            log(f"  картинка не принялась: {ex}")
+            log(f"  картинки не приняты, пост пропущен целиком: {ex}")
             continue
         seen.append(p["link"])
-        if p["doc"]:
-            seen.append(f"tgdoc:{p['doc']}")
-        log(f"  мем опубликован: {p['link']} (лайков {p['likes']})")
+        seen.extend(f"tgdoc:{d}" for d in p["docs"])
+        log(f"  мем опубликован: {p['link']} (фото: {len(p['imgs'])}, лайков {p['likes']})")
         return True
     return False
 
@@ -599,6 +606,46 @@ def send_photo(url, caption):
     log("  картинка ушла файлом")
 
 
+def send_photos(urls, caption):
+    """Одно фото: как раньше. Несколько: альбом (sendMediaGroup), подпись у первого фото.
+
+    Всё или ничего: если не удалось отправить хотя бы одно фото, ошибка, и в канал
+    не уходит ничего (никакого «первого фото из нескольких»).
+    """
+    if len(urls) == 1:
+        send_photo(urls[0], caption)
+        return
+    media = [{"type": "photo", "media": u} for u in urls]
+    media[0]["caption"] = caption[:1024]
+    if caption:
+        media[0]["parse_mode"] = "HTML"
+    try:
+        tg("sendMediaGroup", {"media": media})
+        return
+    except Exception as ex:  # noqa: BLE001
+        log(f"  Telegram не принял ссылки альбома ({ex}), пробую загрузить файлами")
+    files, media = {}, []
+    for i, u in enumerate(urls):
+        data = fetch_image_bytes(u)
+        if not data:
+            raise RuntimeError(f"фото {i + 1} из {len(urls)} не скачать: альбом не публикуем")
+        files[f"p{i}"] = (f"meme{i}.jpg", data)
+        media.append({"type": "photo", "media": f"attach://p{i}"})
+    media[0]["caption"] = caption[:1024]
+    if caption:
+        media[0]["parse_mode"] = "HTML"
+    token = os.environ["TELEGRAM_BOT_TOKEN"]
+    r = requests.post(
+        f"https://api.telegram.org/bot{token}/sendMediaGroup",
+        data={"chat_id": os.environ["TELEGRAM_CHAT_ID"], "media": json.dumps(media)},
+        files=files,
+        timeout=90,
+    )
+    if not r.ok:
+        raise RuntimeError(f"sendMediaGroup файлами: {r.status_code} {r.text[:200]}")
+    log("  альбом ушёл файлами")
+
+
 def esc(s):
     return html.escape(s or "", quote=False)
 
@@ -802,7 +849,9 @@ def check_feeds():
     for url in TG_HUMOR_FEEDS:
         posts = fetch_tg_posts(url)
         likes = sorted((p["likes"] for p in posts), reverse=True)[:5]
-        log(f"[humor/tg] {url}\n    картинок: {len(posts)}, лайки топ-5: {likes}")
+        albums = [len(p["imgs"]) for p in posts if len(p["imgs"]) > 1]
+        log(f"[humor/tg] {url}\n    постов с фото: {len(posts)}, из них альбомов: {len(albums)} "
+            f"(фото в них: {albums}), лайки топ-5: {likes}")
     return 0
 
 
