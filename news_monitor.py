@@ -3,32 +3,26 @@
 
 Рубрики (по слоту времени МСК):
   9:00 -> service: полезный сервис/инструмент для работы (готовый пост от Groq)
-  12:00, 15:00, 18:00, 21:00 -> humor: мем с картинкой (или текстовая шутка)
-
-Мемы: модель с поддержкой картинок смотрит на мем, переводит текст с картинки
-и пишет подпись-пересказ (что происходит и в чём шутка). Если модель с
-картинками недоступна, мем выходит с заголовком записи, как раньше.
+  6:00, 12:00, 15:00, 18:00 -> humor: мем с картинкой (или текстовая шутка)
 
 Запуск:
   python news_monitor.py          # опубликовать один пост
-  python news_monitor.py --check  # только проверить ленты и пробную подпись к мему
+  python news_monitor.py --check  # только проверить, какие ленты доступны
 
 Секреты (переменные окружения):
   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, GROQ_API_KEY_NEWS
 Необязательно:
-  GROQ_MODEL (текст, по умолчанию openai/gpt-oss-20b),
-  GROQ_VISION_MODEL (картинки, по умолчанию qwen/qwen3.8-27b),
-  RUBRIC (service|humor, принудительно)
+  GROQ_MODEL (по умолчанию llama-3.3-70b-versatile), RUBRIC (service|humor, принудительно)
 """
-import base64
 import html
 import json
 import os
 import random
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import feedparser
@@ -44,10 +38,7 @@ MAX_SERVICE_TRIES = 12  # сколько кандидатов может отк�
 TIMEOUT = 20
 USER_AGENT = "Mozilla/5.0 (compatible; news-monitor/1.0)"
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
-GROQ_VISION_MODEL = os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.8-27b")
 ARTICLE_CHARS = 4000    # сколько текста статьи отдаём модели
-MAX_IMAGE_BYTES = 2_500_000  # картинки крупнее отдаём модели ссылкой, а не файлом
-MAX_MEME_BODY = 700     # длина пересказа под мемом (лимит подписи в Telegram 1024)
 
 # Добавлять ли в пост строку «Источник» со ссылкой
 SOURCE_LINK_SERVICE = False   # рубрика «сервисы»: False = готовый пост без ссылки
@@ -56,7 +47,7 @@ SOURCE_LINK_HUMOR = False     # рубрика «юмор»: True = подпис
 SKIP = "SKIP"           # модель решила, что материал не подходит
 
 # Слоты по московскому времени -> рубрика
-SLOTS = {9: "service", 12: "humor", 15: "humor", 18: "humor", 21: "humor"}
+SLOTS = {6: "humor", 9: "service", 12: "humor", 15: "humor", 18: "humor"}
 
 # ВАЖНО: адреса лент не проверены с серверов GitHub. Запусти режим check
 # (см. workflow) и убери/замени те, что не отвечают.
@@ -66,11 +57,34 @@ SERVICE_FEEDS = [
     "https://tproger.ru/feed",
 ]
 
+# kind="image": берём картинку из записи; kind="text": запасной вариант, текстовая шутка.
+# Pikabu «горячее» убран 09.11.2026: в популярное попал комикс с оскорблениями по
+# национальному признаку (pikabu.ru/story/vnimanie_14506494), фильтры его не отсекли.
 HUMOR_FEEDS = [
-    # kind="image": берём картинку из записи; kind="text": запасной вариант, текстовая шутка
-    {"url": "https://pikabu.ru/xmlfeeds.php?cmd=popular", "kind": "image"},
     {"url": "https://www.anekdot.ru/rss/export_j.xml", "kind": "text"},
 ]
+
+# Телеграм-каналы с мемами. Лайки и статистику берём из веб-превью t.me/s/<канал>:
+# там у каждого поста есть реакции и просмотры. Канал читается без авторизации и без
+# Bot API, но t.me не отвечает с части российских провайдеров — с GitHub-раннеров работает.
+# Каналы ранжируются вместе по абсолютному числу лайков: у обоих порядок величин один
+# (десятки-сотни реакций на пост), но если один начнёт забирать все слоты — нормализуем
+# лайки на медиану своего канала.
+TG_HUMOR_FEEDS = [
+    "https://t.me/package_memes",   # «пакет по итэ»: 1-2 мема в день, ~130 лайков
+    "https://t.me/iIT_Mems",        # «За минуту до созвона»: 1-2 мема в день, ~145 лайков
+]
+TG_MAX_AGE_HOURS = 72   # берём только посты не старше этого возраста
+TG_MIN_LIKES = 40       # минимум лайков (сумма реакций), чтобы мем ушёл в канал
+TG_TOP_N = 3            # сколько лучших по лайкам постов пробуем за запуск
+TG_SOURCE_LINK = False  # подпись со ссылкой на оригинальный пост в канале: не ставим
+TG_MAX_IMAGES = 10      # лимит альбома Telegram; в посте больше фото: пропускаем пост целиком
+                        # (мем из нескольких фото берём ЦЕЛИКОМ или не берём совсем)
+
+# Необязательный прокси на случай, когда t.me не открывается с текущей сети
+# (у российских провайдеров бывает). Шаблон: {url} в URL-кодировке.
+# Пример: TG_PROXY="https://api.allorigins.win/raw?url={url}"
+TG_PROXY = os.getenv("TG_PROXY", "").strip()
 
 # Что считаем «полезным сервисом» (фильтр до модели, чтобы не тратить лимит Groq)
 SERVICE_RE = re.compile(
@@ -90,20 +104,6 @@ EXCLUDE_RE = re.compile(
 
 IMG_RE = re.compile(r"""<img[^>]+src=["']([^"']+)["']""", re.IGNORECASE)
 IMG_EXT_RE = re.compile(r"\.(jpe?g|png|webp)(\?|$)", re.IGNORECASE)
-THINK_RE = re.compile(r"(?is)<think>.*?</think>")
-
-# Подписи к картинкам и указания авторов изображений («Схема из патента. Изображение: USPTO»)
-CAPTION_RE = re.compile(
-    r"(?i)^\s*(схема|рисунок|рис\.|фото|фотография|изображение|иллюстрация|скриншот|источник|кадр)\b"
-    r"|\b(изображение|фото|источник|иллюстрация|credit|image)\s*:"
-)
-
-
-def drop_captions(body):
-    """Убирает короткие абзацы-подписи к картинкам и указания авторов изображений."""
-    keep = [p for p in body.split("\n\n")
-            if not (len(p.strip()) <= 200 and CAPTION_RE.search(p.strip()))]
-    return "\n\n".join(keep)
 
 
 def log(msg):
@@ -183,6 +183,214 @@ def find_image(entry):
     return None
 
 
+# ---------------------------------------------------------------- телеграм-каналы
+
+# Служебный текст под мемами канала-источника: в подписи нашего канала он не нужен
+PROMO_RE = re.compile(
+    r"пакет по итэ|другие каналы|проекты|чатик|подписывайтесь|реклама|за минуту до созвона",
+    re.IGNORECASE,
+)
+
+# t.me отдаёт разметку одинаково всем, но с «браузерным» UA меньше шансов попасть
+# на заглушку или в лимит, поэтому для канала используется отдельный User-Agent
+TG_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
+TG_POST_SPLIT_RE = re.compile(r'(?=<div class="tgme_widget_message[^"]*"\s+data-post=)')
+TG_PHOTO_RE = re.compile(
+    r"""tgme_widget_message_photo_wrap[^>]*?background-image:url\('([^']+)'\)""", re.S
+)
+# В class фото-обёртки t.me кладёт id файла: по нему видно, что один и тот же мем
+# пришёл из двух разных каналов (при пересылке id файла сохраняется)
+TG_DOC_RE = re.compile(r'tgme_widget_message_photo_wrap\s+(\d+)\s+[0-9_]+')
+TG_VIEWS_RE = re.compile(r'tgme_widget_message_views">([^<]+)<')
+TG_TIME_RE = re.compile(r'<time datetime="([^"]+)"')
+TG_TEXT_RE = re.compile(r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', re.S)
+TG_REACTION_RE = re.compile(r'<span class="tgme_reaction">.*?</i>([^<]*)</span>', re.S)
+
+
+def _num(value):
+    """'4.5K' -> 4500, '1,2M' -> 1200000, '120' -> 120."""
+    s = str(value or "").strip().replace("\xa0", "").replace(" ", "")
+    m = re.match(r"^([\d.,]+)\s*([KkMмКк]?)$", s)
+    if not m:
+        return 0
+    mult = {"k": 1000, "к": 1000, "m": 1_000_000, "м": 1_000_000}.get(m.group(2).lower(), 1)
+    try:
+        return int(float(m.group(1).replace(",", ".")) * mult)
+    except ValueError:
+        return 0
+
+
+def _parse_time(value):
+    try:
+        dt = datetime.fromisoformat((value or "").replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def tg_preview_url(channel_url):
+    """https://t.me/name -> https://t.me/s/name: веб-превью канала без авторизации."""
+    m = re.match(r"https?://t\.me/(?:s/)?([A-Za-z0-9_]+)/?$", channel_url)
+    return f"https://t.me/s/{m.group(1)}" if m else channel_url
+
+
+def tg_caption(text_html):
+    """Подпись мема: без ссылок, тегов, хэштегов и промо-строк канала-источника."""
+    s = re.sub(r"(?is)<tg-emoji[^>]*>.*?</tg-emoji>", "", text_html or "")
+    s = re.sub(r"(?is)<a [^>]*>(.*?)</a>", r"\1", s)
+    s = re.sub(r"(?is)<br\s*/?>", "\n", s)
+    s = html.unescape(re.sub(r"<[^>]+>", "", s))
+    lines = []
+    for ln in s.splitlines():
+        ln = re.sub(r"[ \t\xa0]+", " ", ln).strip()
+        if len(ln) < 4 or ln.startswith("#") or PROMO_RE.search(ln):
+            continue
+        lines.append(ln)
+    return " ".join(lines)[:900]
+
+
+def tg_get(url, proxy=False):
+    """HTML веб-превью канала: напрямую, а при неудаче или force_proxy — через TG_PROXY."""
+    error = None
+    if not proxy:
+        try:
+            r = requests.get(url, headers={"User-Agent": TG_UA}, timeout=TIMEOUT)
+            log(f"  канал {url}: HTTP {r.status_code}, {len(r.content)} байт")
+            r.raise_for_status()
+            return r.text
+        except Exception as e:  # noqa: BLE001
+            error = e
+            if not TG_PROXY:
+                log(f"  канал недоступен: {url} ({type(e).__name__}: {e})")
+                return None
+    if not TG_PROXY:
+        return None
+    # публичные прокси отвечают медленно и иногда с первого раза отдают 5xx
+    for _ in range(2):
+        try:
+            r = requests.get(
+                TG_PROXY.format(url=quote(url, safe="")),
+                headers={"User-Agent": TG_UA},
+                timeout=max(TIMEOUT, 45),
+            )
+            log(f"  канал через прокси: HTTP {r.status_code}, {len(r.content)} байт")
+            r.raise_for_status()
+            log(f"  канал открыт через прокси: {url}")
+            return r.text
+        except Exception as e2:  # noqa: BLE001
+            error = e2
+    log(f"  канал недоступен: {url} ({type(error).__name__}: {error})")
+    return None
+
+
+def parse_tg_page(page):
+    """Посты из HTML веб-превью: {link, img, imgs, likes, views, text, docs, published}."""
+    posts = []
+    for chunk in TG_POST_SPLIT_RE.split(page or "")[1:]:
+        m_post = re.search(r'data-post="([^"]+)"', chunk)
+        # альбом: в одном посте несколько фото, берём все по порядку без дублей
+        imgs = []
+        for m_img in TG_PHOTO_RE.finditer(chunk):
+            img = html.unescape(m_img.group(1))
+            if img.startswith("//"):
+                img = "https:" + img
+            if _is_http(img) and img not in imgs:
+                imgs.append(img)
+        # видео и гифки этой рубрикой не берём (в том числе внутри альбома: целиком или никак)
+        if not m_post or not imgs or "tgme_widget_message_video" in chunk:
+            continue
+        if len(imgs) > TG_MAX_IMAGES:
+            log(f"  в посте {len(imgs)} фото (больше {TG_MAX_IMAGES}), пропускаю: {m_post.group(1)}")
+            continue
+        m_text = TG_TEXT_RE.search(chunk)
+        m_time = TG_TIME_RE.search(chunk)
+        m_views = TG_VIEWS_RE.search(chunk)
+        # id файлов в разметке: по ним ловим один и тот же мем из разных каналов
+        docs = list(dict.fromkeys(TG_DOC_RE.findall(chunk)))
+        posts.append({
+            "link": f"https://t.me/{m_post.group(1)}",
+            "img": imgs[0],
+            "imgs": imgs,
+            "likes": sum(_num(x) for x in TG_REACTION_RE.findall(chunk)),
+            "views": _num(m_views.group(1)) if m_views else 0,
+            "text": tg_caption(m_text.group(1) if m_text else ""),
+            "docs": docs,
+            "published": _parse_time(m_time.group(1)) if m_time else None,
+        })
+    if not posts:
+        markup = "разметка распознана" if "tgme_widget_message" in (page or "") else "разметка не распознана"
+        log(f"  в превью нет постов с фото (страница {len(page or '')} байт, {markup})")
+    return posts
+
+
+def fetch_tg_posts(channel_url):
+    """Посты канала с картинками; если напрямую ничего не вышло — пробуем через прокси."""
+    url = tg_preview_url(channel_url)
+    page = tg_get(url)
+    if page is None:
+        return []
+    posts = parse_tg_page(page)
+    if not posts and TG_PROXY:
+        page = tg_get(url, proxy=True)
+        posts = parse_tg_page(page) if page else []
+    return posts
+
+
+def tg_short(link):
+    """https://t.me/package_memes/2890 -> package_memes/2890 (для лога)."""
+    return (link or "").replace("https://t.me/", "", 1)
+
+
+def run_tg_humor(seen):
+    """Лучший по лайкам свежий мем из телеграм-каналов."""
+    seen_set = set(seen)
+    now = datetime.now(timezone.utc)
+    candidates = []
+    for channel_url in TG_HUMOR_FEEDS:
+        posts = fetch_tg_posts(channel_url)
+        log(f"  канал {channel_url}: картинок {len(posts)}")
+        for p in posts:
+            if not p["published"] or p["link"] in seen_set:
+                continue
+            if any(f"tgdoc:{d}" in seen_set for d in p["docs"]):   # этот же мем уже постили
+                continue
+            if p["likes"] < TG_MIN_LIKES:
+                continue
+            age_hours = (now - p["published"]).total_seconds() / 3600
+            if age_hours > TG_MAX_AGE_HOURS:
+                continue
+            candidates.append(p)
+    if not candidates:
+        log(f"  нет свежих мемов с {TG_MIN_LIKES}+ лайками")
+        return False
+    candidates.sort(key=lambda p: p["likes"], reverse=True)
+    log("  топ по лайкам: " + "; ".join(
+        f"{p['likes']}♥ {p['views']}👁 {tg_short(p['link'])} ({len(p['imgs'])} фото)"
+        for p in candidates[:TG_TOP_N]
+    ))
+    for p in candidates[:TG_TOP_N]:
+        if is_blocked({}, p["text"]) or (p["text"] and not groq_humor_ok("Мем", p["text"])):
+            log(f"  отклонено фильтром: {p['link']}")
+            continue
+        caption = esc(p["text"])
+        if TG_SOURCE_LINK:
+            caption += ('\n\n' if caption else '') + f'<a href="{esc(p["link"])}">источник</a>'
+        try:
+            send_photos(p["imgs"], caption)   # альбом уходит целиком или не уходит совсем
+        except Exception as ex:  # noqa: BLE001
+            log(f"  картинки не приняты, пост пропущен целиком: {ex}")
+            continue
+        seen.append(p["link"])
+        seen.extend(f"tgdoc:{d}" for d in p["docs"])
+        log(f"  мем опубликован: {p['link']} (фото: {len(p['imgs'])}, лайков {p['likes']})")
+        return True
+    return False
+
+
 # ---------------------------------------------------------------- Groq
 
 def article_text(entry, fallback):
@@ -229,7 +437,7 @@ def page_image(link):
 
 def parse_post(content):
     """Ответ модели -> (заголовок, текст) или SKIP или None."""
-    content = THINK_RE.sub("", content or "").strip()
+    content = (content or "").strip()
     if content.upper().startswith(SKIP) and len(content) < 20:
         return SKIP
     content = content.replace("*", "").replace("#", "")
@@ -239,7 +447,7 @@ def parse_post(content):
         return None
     headline = re.sub(r"^(заголовок|название)\s*:\s*", "", lines[0], flags=re.IGNORECASE)
     headline = headline.strip(" «»\"'")
-    body = drop_captions("\n\n".join(lines[1:]))
+    body = "\n\n".join(lines[1:])
     body = split_paragraphs(body)
     return (headline, body) if headline and body else None
 
@@ -292,8 +500,6 @@ def groq_post(title, text):
         "- основной текст 400-700 символов из ТРЁХ коротких абзацев, между абзацами пустая "
         "строка: 1) что это за сервис или приём; 2) что он умеет, 2-3 главные возможности; "
         "3) кому и чем полезен в работе;\n"
-        "- игнорируй подписи к картинкам, указания авторов изображений и ссылки на "
-        "источники, в пост они не входят;\n"
         "- используй только факты из текста, не выдумывай цифры, цены, названия и функции;\n"
         "- без хэштегов, без эмодзи, без разметки Markdown.\n\n"
         f"Материал:\n{title}\n{text}"
@@ -343,8 +549,101 @@ def send_text(text, preview=True):
     })
 
 
+MAX_PHOTO_BYTES = 9 * 1024 * 1024   # запас под лимит Telegram в 10 МБ
+
+
+def fetch_image_bytes(url):
+    """Скачивает картинку по ссылке: Telegram не всегда может забрать её сам."""
+    headers = {"User-Agent": TG_UA}
+    if "telesco" in url:      # CDN веб-превью отдаёт файл охотнее с Referer'ом
+        headers["Referer"] = "https://t.me/"
+    try:
+        r = requests.get(url, headers=headers, timeout=TIMEOUT)
+        r.raise_for_status()
+        ctype = str(r.headers.get("content-type", ""))
+        if not ctype.startswith("image"):
+            log(f"  по ссылке не картинка ({ctype}), пропускаю")
+            return None
+        if len(r.content) > MAX_PHOTO_BYTES:
+            log(f"  картинка слишком большая ({len(r.content)} байт), пропускаю")
+            return None
+        return r.content
+    except Exception as e:  # noqa: BLE001
+        log(f"  картинку не скачать: {type(e).__name__}: {e}")
+        return None
+
+
+def send_photo_bytes(data, caption):
+    """Отправляет картинку файлом (multipart), а не ссылкой."""
+    token = os.environ["TELEGRAM_BOT_TOKEN"]
+    payload = {"chat_id": os.environ["TELEGRAM_CHAT_ID"], "caption": caption[:1024]}
+    if caption:
+        payload["parse_mode"] = "HTML"
+    r = requests.post(
+        f"https://api.telegram.org/bot{token}/sendPhoto",
+        data=payload,
+        files={"photo": ("meme.jpg", data)},
+        timeout=60,
+    )
+    if not r.ok:
+        raise RuntimeError(f"sendPhoto файлом: {r.status_code} {r.text[:200]}")
+
+
 def send_photo(url, caption):
-    tg("sendPhoto", {"photo": url, "caption": caption[:1024], "parse_mode": "HTML"})
+    """Фото ссылкой; если Telegram не смог её забрать — качаем сами и грузим файлом."""
+    payload = {"photo": url, "caption": caption[:1024]}
+    if caption:
+        payload["parse_mode"] = "HTML"
+    try:
+        tg("sendPhoto", payload)
+        return
+    except Exception as ex:  # noqa: BLE001
+        log(f"  Telegram не принял ссылку ({ex}), пробую загрузить файлом")
+    data = fetch_image_bytes(url)
+    if not data:
+        raise RuntimeError("картинку не удалось ни отправить ссылкой, ни скачать")
+    send_photo_bytes(data, caption)
+    log("  картинка ушла файлом")
+
+
+def send_photos(urls, caption):
+    """Одно фото: как раньше. Несколько: альбом (sendMediaGroup), подпись у первого фото.
+
+    Всё или ничего: если не удалось отправить хотя бы одно фото, ошибка, и в канал
+    не уходит ничего (никакого «первого фото из нескольких»).
+    """
+    if len(urls) == 1:
+        send_photo(urls[0], caption)
+        return
+    media = [{"type": "photo", "media": u} for u in urls]
+    media[0]["caption"] = caption[:1024]
+    if caption:
+        media[0]["parse_mode"] = "HTML"
+    try:
+        tg("sendMediaGroup", {"media": media})
+        return
+    except Exception as ex:  # noqa: BLE001
+        log(f"  Telegram не принял ссылки альбома ({ex}), пробую загрузить файлами")
+    files, media = {}, []
+    for i, u in enumerate(urls):
+        data = fetch_image_bytes(u)
+        if not data:
+            raise RuntimeError(f"фото {i + 1} из {len(urls)} не скачать: альбом не публикуем")
+        files[f"p{i}"] = (f"meme{i}.jpg", data)
+        media.append({"type": "photo", "media": f"attach://p{i}"})
+    media[0]["caption"] = caption[:1024]
+    if caption:
+        media[0]["parse_mode"] = "HTML"
+    token = os.environ["TELEGRAM_BOT_TOKEN"]
+    r = requests.post(
+        f"https://api.telegram.org/bot{token}/sendMediaGroup",
+        data={"chat_id": os.environ["TELEGRAM_CHAT_ID"], "media": json.dumps(media)},
+        files=files,
+        timeout=90,
+    )
+    if not r.ok:
+        raise RuntimeError(f"sendMediaGroup файлами: {r.status_code} {r.text[:200]}")
+    log("  альбом ушёл файлами")
 
 
 def esc(s):
@@ -458,96 +757,6 @@ def groq_humor_ok(title, text):
         return True
 
 
-def download_image_b64(url):
-    """Скачивает картинку и отдаёт data:-ссылку для Groq. None, если не вышло или файл большой."""
-    try:
-        r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT)
-        r.raise_for_status()
-        if len(r.content) > MAX_IMAGE_BYTES:
-            return None
-        ctype = r.headers.get("Content-Type", "").split(";")[0].strip().lower()
-        if not ctype.startswith("image/"):
-            ctype = "image/png" if url.lower().split("?")[0].endswith(".png") else "image/jpeg"
-        return f"data:{ctype};base64,{base64.b64encode(r.content).decode()}"
-    except Exception as e:  # noqa: BLE001
-        log(f"  картинку не скачать: {type(e).__name__}: {e}")
-        return None
-
-
-def groq_vision_request(key, body):
-    """Запрос к модели с картинками; если она не принимает reasoning_format, повторяет без него."""
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {key}"}
-    last = ""
-    for extra in ({"reasoning_format": "hidden"}, {}):
-        r = requests.post(url, headers=headers, json={**body, **extra}, timeout=60)
-        if r.ok:
-            return r.json()["choices"][0]["message"]["content"] or ""
-        last = f"{r.status_code} {r.text[:300]}"
-        if not (r.status_code == 400 and "reasoning" in r.text.lower() and extra):
-            break
-    raise RuntimeError(last)
-
-
-def cut_sentences(text, limit):
-    """Обрезает текст до limit символов по границе предложения."""
-    if len(text) <= limit:
-        return text
-    part = text[:limit]
-    m = max(part.rfind(". "), part.rfind("! "), part.rfind("? "), part.rfind(".\n"))
-    return part[:m + 1].rstrip() if m > limit // 2 else part.rstrip(" ,;:-") + "…"
-
-
-def groq_meme(title, summary, img_url):
-    """Подпись к мему от модели, которая видит картинку.
-
-    Возвращает (заголовок, пересказ), SKIP (мем не подходит) или None (модель недоступна).
-    """
-    key = os.getenv("GROQ_API_KEY_NEWS")
-    if not key:
-        return None
-    prompt = (
-        "Ты редактор Telegram-канала «Сила ботов»: IT, нейросети, офисные будни, юмор. "
-        "Тебе дана картинка-мем и заголовок поста с Пикабу. Нужно написать подпись-пересказ, "
-        "чтобы читателю было всё понятно без исходной публикации и без знания иностранных языков.\n\n"
-        "Ответь одним словом SKIP, если: на картинке нет шутки или смысла; это реклама, ссылки, "
-        "QR-код или отсылка на чужие каналы; текст на картинке невозможно разобрать; тема про "
-        "смерть, насилие, преступления, болезни, войну, политику, скандалы с реальными людьми "
-        "или 18+.\n\n"
-        "Иначе напиши на русском языке:\n"
-        "- первая строка: короткий заголовок до 70 символов, без кавычек и разметки;\n"
-        "- пустая строка;\n"
-        "- 2-4 коротких предложения (до 450 символов): что происходит на картинке, кто что "
-        "сказал или сделал, в чём шутка. Текст на другом языке переведи на русский, ключевые "
-        "реплики перескажи близко к тексту, с указанием, кто их говорит;\n"
-        "- только то, что видно на картинке и сказано в заголовке и тексте поста; ничего не "
-        "выдумывай: ни имена, ни цифры, ни концовку истории;\n"
-        "- без хэштегов, эмодзи и разметки Markdown.\n\n"
-        f"Заголовок поста: {title}\n"
-        f"Текст поста: {summary[:600] or 'нет'}"
-    )
-    image = download_image_b64(img_url) or img_url
-    body = {
-        "model": GROQ_VISION_MODEL,
-        "messages": [{"role": "user", "content": [
-            {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {"url": image}},
-        ]}],
-        "temperature": 0.3,
-        "max_tokens": 2000,
-    }
-    try:
-        return parse_post(groq_vision_request(key, body))
-    except Exception as e:  # noqa: BLE001
-        log(f"  модель с картинками не ответила ({GROQ_VISION_MODEL}): {type(e).__name__}: {e}")
-        return None
-
-
-def meme_caption(headline, body):
-    """Подпись под мем: жирный заголовок и пересказ, не длиннее лимита Telegram."""
-    return f"<b>{esc(headline)}</b>\n\n{esc(cut_sentences(body, MAX_MEME_BODY))}"
-
-
 def run_humor(seen):
     seen_set = set(seen)
     image_feeds = [f for f in HUMOR_FEEDS if f["kind"] == "image"]
@@ -555,6 +764,9 @@ def run_humor(seen):
     random.shuffle(image_feeds)
     random.shuffle(text_feeds)
     attempts = 0
+
+    if run_tg_humor(seen):
+        return True
 
     for feed in image_feeds:
         for e in fetch_feed(feed["url"]):
@@ -572,25 +784,12 @@ def run_humor(seen):
             if attempts >= MAX_ATTEMPTS:
                 break
             attempts += 1
-
-            meme = groq_meme(title, summary, img)
-            if meme == SKIP:
-                log(f"  мем отклонён моделью: {title}")
+            if not groq_humor_ok(title, summary):
+                log(f"  отклонено моделью: {title}")
                 seen.append(key)
                 seen_set.add(key)
                 continue
-            if meme is None:
-                # модель с картинками недоступна: подпись из заголовка, как раньше
-                log("::warning::Подпись к мему не написана (модель с картинками недоступна), "
-                    "беру заголовок записи")
-                if not groq_humor_ok(title, summary):
-                    log(f"  отклонено моделью: {title}")
-                    seen.append(key)
-                    seen_set.add(key)
-                    continue
-                caption = f"<b>{esc(title)}</b>"
-            else:
-                caption = meme_caption(*meme)
+            caption = f"<b>{esc(title)}</b>"
             if SOURCE_LINK_HUMOR:
                 caption += f"\n\n<a href=\"{esc(key)}\">Источник</a>"
             seen.append(key)  # помечаем сразу: битую картинку повторно не пробуем
@@ -642,25 +841,17 @@ def check_feeds():
     feeds = [("service", u) for u in SERVICE_FEEDS] + [
         (f"humor/{f['kind']}", f["url"]) for f in HUMOR_FEEDS
     ]
-    sample = None  # первая запись с картинкой из ленты мемов: для пробной подписи
     for label, url in feeds:
         entries = fetch_feed(url)
         with_img = sum(1 for e in entries if find_image(e))
         first = strip_html(entries[0].get("title", ""))[:60] if entries else "-"
         log(f"[{label}] {url}\n    записей: {len(entries)}, с картинкой: {with_img}, первая: {first}")
-        if sample is None and label == "humor/image":
-            sample = next((e for e in entries if find_image(e)), None)
-
-    if sample is not None:
-        title = strip_html(sample.get("title", ""))
-        log(f"[вид мема] пробная подпись к записи: {title}")
-        meme = groq_meme(title, strip_html(sample.get("summary", "")), find_image(sample))
-        if meme is None:
-            log(f"    модель с картинками недоступна ({GROQ_VISION_MODEL}): мемы будут с заголовком записи")
-        elif meme == SKIP:
-            log("    модель ответила SKIP (мем не подходит), но связь с моделью работает")
-        else:
-            log(f"    заголовок: {meme[0]}\n    текст: {meme[1]}")
+    for url in TG_HUMOR_FEEDS:
+        posts = fetch_tg_posts(url)
+        likes = sorted((p["likes"] for p in posts), reverse=True)[:5]
+        albums = [len(p["imgs"]) for p in posts if len(p["imgs"]) > 1]
+        log(f"[humor/tg] {url}\n    постов с фото: {len(posts)}, из них альбомов: {len(albums)} "
+            f"(фото в них: {albums}), лайки топ-5: {likes}")
     return 0
 
 
