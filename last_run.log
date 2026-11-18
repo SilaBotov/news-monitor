@@ -1,18 +1,9 @@
-Рубрика: service
-  кандидатов: 32
-  не подходит: Apple: масштабный сбой систем и сервисов компании произошёл из-за внутреннего обновления
-  не подходит: Не Клодом единым — как после бана я переписал командный плагин на разные хосты моделей
-  не подходит: Мы каждый день разговариваем со всеми знаниями человечества. Но становимся ли мы умнее?
-  не подходит: Astra 6.2, Qwen 4, Fable 5.2 и Opus 5.5: нейросети снова соревнуются, а теперь ещё и судят друг друга
-  не подходит: Vals AI: ИИ‑модели можно использовать как автономное оружие. Они находят цели на снимках и выбирают гражданских
-  Groq не ответил: RuntimeError: 429 {"error":{"message":"Rate limit reached for model `openai/gpt-oss-20b` in organization `org_01m6n5ymnsemmsp7ve1hdq8t0x` service tier `on_demand` on tokens per minute (TPM): Limit 8000, Used 7187, Requested 1905. Please try again in 8.19s. Need more tokens? Upgrade to Dev Tier today at https://consol
-::warning::Groq не дал пост, рубрика сервисов пропущена
-  сервисов нет, публикуем юмор, чтобы слот не пропал
-  канал https://t.me/s/package_memes: HTTP 200, 136394 байт
+Рубрика: humor
+  канал https://t.me/s/package_memes: HTTP 200, 135736 байт
   канал https://t.me/package_memes: картинок 15
-  канал https://t.me/s/iIT_Mems: HTTP 200, 118521 байт
+  канал https://t.me/s/iIT_Mems: HTTP 200, 118525 байт
   канал https://t.me/iIT_Mems: картинок 19
-  топ по лайкам: 92♥ 1810👁 iIT_Mems/1551 (1 фото); 43♥ 810👁 package_memes/2915 (1 фото)
+  топ по лайкам: 81♥ 1690👁 package_memes/2915 (1 фото)
   Telegram не принял ссылку (sendPhoto: 400 {"ok":false,"error_code":400,"description":"Bad Request: failed to get HTTP URL content"}), пробую загрузить файлом
   картинка ушла файлом
-  мем опубликован: https://t.me/iIT_Mems/1551 (фото: 1, лайков 92)
+  мем опубликован: https://t.me/package_memes/2915 (фото: 1, лайков 81)
