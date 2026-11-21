@@ -1,9 +1,16 @@
-Рубрика: humor
-  канал https://t.me/s/package_memes: HTTP 200, 137636 байт
+Рубрика: service
+  кандидатов: 29
+  не подходит: Из разработки в FDE. Почему я ставлю на инженеров, которые сами идут к заказчику
+  не подходит: Доказательство гипотезы Римана с помощью ИИ
+  не подходит: Куда инвестировать в AI: кто заработает на новой промышленной революции?
+  не подходит: Что дают графовые нейросети сверх истории событий: эксперименты на Лиме и Чикаго
+  не подходит: [Перевод] Гипотеза Римана и Claude: заметки о работе над доказательством
+  Groq не ответил: RuntimeError: 429 {"error":{"message":"Rate limit reached for model `openai/gpt-oss-20b` in organization `org_01m6n5ymnsemmsp7ve1hdq8t0x` service tier `on_demand` on tokens per minute (TPM): Limit 8000, Used 7802, Requested 1835. Please try again in 12.2775s. Need more tokens? Upgrade to Dev Tier today at https://con
+::warning::Groq не дал пост, рубрика сервисов пропущена
+  сервисов нет, публикуем юмор, чтобы слот не пропал
+  канал https://t.me/s/package_memes: HTTP 200, 137640 байт
   канал https://t.me/package_memes: картинок 15
-  канал https://t.me/s/iIT_Mems: HTTP 200, 118647 байт
+  канал https://t.me/s/iIT_Mems: HTTP 200, 118644 байт
   канал https://t.me/iIT_Mems: картинок 19
-  топ по лайкам: 77♥ 1790👁 iIT_Mems/1552 (1 фото)
-  Telegram не принял ссылку (sendPhoto: 400 {"ok":false,"error_code":400,"description":"Bad Request: failed to get HTTP URL content"}), пробую загрузить файлом
-  картинка ушла файлом
-  мем опубликован: https://t.me/iIT_Mems/1552 (фото: 1, лайков 77)
+  нет свежих мемов с 40+ лайками
+  текстовая шутка опубликована
